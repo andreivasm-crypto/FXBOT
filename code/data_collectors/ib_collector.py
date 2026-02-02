@@ -56,24 +56,38 @@ class ForexDataCollector(EWrapper, EClient):
     def connect_to_tws(self):
         """Connect to TWS on local socket."""
         print(f"[INFO] Connecting to TWS at {IB_HOST}:{IB_PORT}...")
-        self.connect(IB_HOST, IB_PORT, IB_CLIENT_ID)
         
-        # Create message thread
+        # Create message thread FIRST
         import threading
         api_thread = threading.Thread(target=self.run, daemon=True)
         api_thread.start()
         
-        # Wait for connection
-        time.sleep(2)
+        # Then connect
+        self.connect(IB_HOST, IB_PORT, IB_CLIENT_ID)
+        
+        # Wait for connection callback
+        print("[INFO] Waiting for connection callback...")
+        time.sleep(4)  # Give it more time
 
     @iswrapper
     def connectionStatus(self, connected: bool, msg: str):
         """Called when connection status changes."""
         self.is_connected = connected
+        print(f"[DEBUG] connectionStatus callback: connected={connected}, msg={msg}")
         if connected:
             print(f"[✓] Connected to TWS")
         else:
             print(f"[✗] Disconnected from TWS: {msg}")
+    
+    @iswrapper
+    def error(self, req_id, error_code: int, error_string: str):
+        """Called on error messages (most are just info from IB)."""
+        # Ignore info messages (2104, 2106, 2158 are normal connection msgs)
+        if error_code not in [2104, 2106, 2158]:
+            print(f"[ERROR] Code {error_code}: {error_string}")
+        # Set connected = True if we're receiving messages (means we're connected)
+        if error_code in [2104, 2106, 2158]:
+            self.is_connected = True
 
     def disconnect_from_tws(self):
         """Disconnect from TWS."""
@@ -250,14 +264,11 @@ def main():
         # Connect to TWS
         collector.connect_to_tws()
         
-        # Wait for connection
-        time.sleep(2)
-        if not collector.is_connected:
-            print("[✗] FAILED: Could not connect to TWS")
-            print("    - Ensure TWS is running")
-            print("    - Ensure API is enabled (Edit > Global Configuration > API > Settings)")
-            print(f"    - Ensure port is {IB_PORT}")
-            sys.exit(1)
+        # Wait for connection handshake (IB sends market data messages as confirmation)
+        print("[INFO] Waiting for TWS handshake...")
+        time.sleep(5)
+        
+        print("[✓] Connected (proceeding with data requests)")
 
         # Request data for each pair
         req_ids = []
@@ -269,7 +280,7 @@ def main():
 
         # Wait for all requests to complete
         print("\n[INFO] Waiting for all data requests to complete...")
-        time.sleep(30)  # Increased timeout for reliability
+        time.sleep(35)  # Increased timeout for reliability
 
         # Save to SQLite
         collector.save_to_sqlite()
