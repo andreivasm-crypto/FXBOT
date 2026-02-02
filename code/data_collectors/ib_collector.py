@@ -1,298 +1,292 @@
 #!/usr/bin/env python3
 """
-Interactive Brokers Data Collector
-Fetches historical forex data from your running TWS instance
-Account: DUK476547
-Connection: 127.0.0.1:7497
-Client ID: 42
+IBDataCollector.py
+Fetches 1-year historical forex OHLCV data from Interactive Brokers TWS.
+
+SETUP:
+1. Ensure TWS is running and API is enabled (on port 7497)
+2. Run: python3 ib_collector.py
+3. Data saved to: ../data/forex_1year.db (SQLite)
+
+PAIRS: EUR/USD, GBP/USD, AUD/USD, USD/JPY
+TIMEFRAME: Daily (1 day)
+DURATION: 1 year
 """
 
 import sqlite3
-import pandas as pd
 import time
-import threading
+from datetime import datetime, timedelta
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
-from ibapi.common import TickAttrib
-import logging
+from ibapi.utils import iswrapper
+import pandas as pd
+import sys
+import os
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# ============================================================================
+# CONFIG (DRE's Account - Hardcoded for Security)
+# ============================================================================
+IB_HOST = "127.0.0.1"  # Local TWS socket
+IB_PORT = 7497
+IB_CLIENT_ID = 42
+IB_ACCOUNT = "DUK476547"
 
+# Pairs to fetch
+FOREX_PAIRS = [
+    ("EUR", "USD"),
+    ("GBP", "USD"),
+    ("AUD", "USD"),
+    ("USD", "JPY"),
+]
 
-class IBDataCollector(EWrapper, EClient):
-    """Collect forex data from Interactive Brokers TWS"""
-    
-    def __init__(self, db_path='data/forex_1year.db'):
+# ============================================================================
+# DATA COLLECTOR
+# ============================================================================
+class ForexDataCollector(EWrapper, EClient):
+    """Connects to TWS, fetches forex data, stores in SQLite."""
+
+    def __init__(self):
         EClient.__init__(self, self)
         self.data = {}
-        self.db_path = db_path
-        self.next_req_id = 1
-        self.connected = False
-        
-        # Initialize database
-        self._init_db()
-        logger.info(f"Database initialized: {db_path}")
-    
-    def _init_db(self):
-        """Create SQLite database tables"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Create OHLCV table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS forex_data (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                date TEXT NOT NULL,
-                open REAL,
-                high REAL,
-                low REAL,
-                close REAL,
-                volume INTEGER,
-                UNIQUE(symbol, date)
-            )
-        ''')
-        
-        conn.commit()
-        conn.close()
-    
-    def error(self, reqId, errorCode, errorString):
-        """Handle errors from TWS"""
-        logger.error(f"Error ID {reqId}: Code {errorCode} - {errorString}")
-    
-    def connectionClosed(self):
-        """Called when TWS connection closes"""
-        logger.warning("TWS connection closed")
-        self.connected = False
-    
-    def nextValidId(self, orderId):
-        """Called when connection establishes"""
-        super().nextValidId(orderId)
-        self.next_req_id = orderId
-        self.connected = True
-        logger.info(f"✅ Connected to TWS (Next Valid ID: {orderId})")
-    
-    def historicalData(self, reqId, bar):
-        """Called for each historical bar from TWS"""
-        if reqId not in self.data:
-            self.data[reqId] = []
-        
-        self.data[reqId].append({
-            'date': bar.date,
-            'open': bar.open,
-            'high': bar.high,
-            'low': bar.low,
-            'close': bar.close,
-            'volume': bar.volume
-        })
-        
-        logger.info(f"Received bar: {bar.date} - {bar.close:.4f}")
-    
-    def historicalDataEnd(self, reqId, start, end):
-        """Called when all historical data is received"""
-        logger.info(f"✅ Data request {reqId} complete: {len(self.data[reqId])} bars")
-    
+        self.is_connected = False
+        self.request_id = 10000
+        self.db_path = None
+
     def connect_to_tws(self):
-        """Connect to TWS on localhost"""
-        logger.info("Connecting to TWS at 127.0.0.1:7497...")
+        """Connect to TWS on local socket."""
+        print(f"[INFO] Connecting to TWS at {IB_HOST}:{IB_PORT}...")
+        self.connect(IB_HOST, IB_PORT, IB_CLIENT_ID)
         
-        try:
-            self.connect("127.0.0.1", 7497, clientId=42)
-            
-            # Start reader thread
-            thread = threading.Thread(target=self.run, daemon=True)
-            thread.start()
-            
-            # Wait for connection
-            timeout = 10
-            start = time.time()
-            while not self.connected and (time.time() - start) < timeout:
-                time.sleep(0.1)
-            
-            if self.connected:
-                logger.info("✅ Connected to TWS successfully")
-                return True
-            else:
-                logger.error("❌ Failed to connect to TWS (timeout)")
-                return False
+        # Create message thread
+        import threading
+        api_thread = threading.Thread(target=self.run, daemon=True)
+        api_thread.start()
         
-        except Exception as e:
-            logger.error(f"❌ Connection error: {e}")
-            return False
-    
-    def fetch_forex_data(self, symbol, duration='1 Y', barsize='4 hours'):
-        """
-        Fetch historical forex data
-        
-        Args:
-            symbol: e.g., 'EUR.USD'
-            duration: e.g., '1 Y' (1 year)
-            barsize: e.g., '4 hours', '1 hour', '1 day'
-        """
-        logger.info(f"Fetching {symbol} ({duration}, {barsize})...")
-        
+        # Wait for connection
+        time.sleep(2)
+
+    @iswrapper
+    def connectionStatus(self, connected: bool, msg: str):
+        """Called when connection status changes."""
+        self.is_connected = connected
+        if connected:
+            print(f"[✓] Connected to TWS")
+        else:
+            print(f"[✗] Disconnected from TWS: {msg}")
+
+    def disconnect_from_tws(self):
+        """Disconnect from TWS."""
+        print("[INFO] Disconnecting from TWS...")
+        self.disconnect()
+        time.sleep(1)
+
+    def create_forex_contract(self, pair_from, pair_to):
+        """Create IB contract for forex pair."""
         contract = Contract()
-        contract.symbol = symbol.split('.')[0]
-        contract.secType = 'CASH'
-        contract.exchange = 'IDEALPRO'
-        contract.currency = symbol.split('.')[1]
+        contract.symbol = pair_from
+        contract.secType = "CASH"
+        contract.currency = pair_to
+        contract.exchange = "IDEALPRO"
+        return contract
+
+    def request_historical_data(self, contract, pair_name):
+        """Request 1 year of daily OHLCV data for a pair."""
+        self.request_id += 1
+        req_id = self.request_id
+
+        # End date: today
+        end_date = datetime.now().strftime("%Y%m%d %H:%M:%S")
         
-        req_id = self.next_req_id
-        self.next_req_id += 1
+        # Duration: 1 year
+        duration = "1 Y"
+        bar_size = "1 day"
+        what_to_show = "MIDPOINT"  # Use midpoint for forex
+        use_rth = 0  # Include extended trading hours
+
+        print(f"[→] Requesting {pair_name} historical data (1 year, daily)...")
         
-        self.data[req_id] = []
-        
-        # Request historical data
         self.reqHistoricalData(
-            reqId=req_id,
-            contract=contract,
-            endDateTime='',
-            durationStr=duration,
-            barSizeSetting=barsize,
-            whatToShow='MIDPOINT',
-            useRTH=1,
-            formatDate=1,
-            keepUpToDate=False
+            req_id,
+            contract,
+            end_date,
+            duration,
+            bar_size,
+            what_to_show,
+            use_rth,
+            1,  # formatDate: 1 = yyyyMMdd
+            False,
+            []
+        )
+
+        # Wait for data
+        self.data[req_id] = {"pair": pair_name, "bars": []}
+        return req_id
+
+    @iswrapper
+    def historicalData(self, req_id: int, bar):
+        """Called when a bar is received."""
+        if req_id in self.data:
+            self.data[req_id]["bars"].append({
+                "date": bar.date,
+                "open": bar.open,
+                "high": bar.high,
+                "low": bar.low,
+                "close": bar.close,
+                "volume": bar.volume,
+            })
+
+    @iswrapper
+    def historicalDataEnd(self, req_id: int, start: str, end: str):
+        """Called when historical data request is complete."""
+        if req_id in self.data:
+            pair = self.data[req_id]["pair"]
+            bars = self.data[req_id]["bars"]
+            print(f"[✓] {pair}: Received {len(bars)} bars ({start} to {end})")
+
+    def save_to_sqlite(self):
+        """Save all collected data to SQLite database."""
+        db_path = os.path.join(
+            os.path.dirname(__file__),
+            "../data/forex_1year.db"
         )
         
-        # Wait for data
-        timeout = 60
-        start = time.time()
-        while req_id not in self.data or len(self.data[req_id]) == 0:
-            if (time.time() - start) > timeout:
-                logger.error(f"❌ Timeout fetching {symbol}")
-                return None
-            time.sleep(0.1)
-        
-        return req_id
-    
-    def save_to_db(self, symbol, req_id):
-        """Save fetched data to SQLite"""
-        if req_id not in self.data or len(self.data[req_id]) == 0:
-            logger.warning(f"No data to save for {symbol}")
-            return False
+        print(f"\n[INFO] Saving data to: {db_path}")
         
         try:
-            df = pd.DataFrame(self.data[req_id])
-            
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(db_path)
             cursor = conn.cursor()
-            
-            # Prepare data
-            df['symbol'] = symbol
-            df = df[['symbol', 'date', 'open', 'high', 'low', 'close', 'volume']]
-            
-            # Insert data
-            for _, row in df.iterrows():
-                cursor.execute('''
-                    INSERT OR REPLACE INTO forex_data 
-                    (symbol, date, open, high, low, close, volume)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', tuple(row))
-            
+
+            # Create table if it doesn't exist
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS forex_ohlcv (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pair TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    open REAL NOT NULL,
+                    high REAL NOT NULL,
+                    low REAL NOT NULL,
+                    close REAL NOT NULL,
+                    volume INTEGER,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(pair, date)
+                )
+            """)
+
+            # Insert data for each pair
+            total_rows = 0
+            for req_id, data in self.data.items():
+                pair = data["pair"]
+                bars = data["bars"]
+                
+                for bar in bars:
+                    try:
+                        cursor.execute("""
+                            INSERT OR REPLACE INTO forex_ohlcv
+                            (pair, date, open, high, low, close, volume)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            pair,
+                            bar["date"],
+                            bar["open"],
+                            bar["high"],
+                            bar["low"],
+                            bar["close"],
+                            bar["volume"]
+                        ))
+                        total_rows += 1
+                    except sqlite3.IntegrityError:
+                        pass  # Skip duplicates
+
             conn.commit()
             conn.close()
             
-            logger.info(f"✅ Saved {len(df)} rows for {symbol} to database")
-            return True
-        
+            print(f"[✓] Saved {total_rows} total rows to SQLite")
+            
+            # Verify data
+            self.verify_sqlite_data(db_path)
+
         except Exception as e:
-            logger.error(f"❌ Error saving data: {e}")
-            return False
-    
-    def disconnect_from_tws(self):
-        """Disconnect from TWS"""
-        logger.info("Disconnecting from TWS...")
-        self.disconnect()
-        logger.info("✅ Disconnected")
-    
-    def validate_data(self, symbol):
-        """Validate saved data quality"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            df = pd.read_sql(
-                f"SELECT * FROM forex_data WHERE symbol = '{symbol}' ORDER BY date",
-                conn
-            )
-            conn.close()
-            
-            if len(df) == 0:
-                logger.warning(f"No data found for {symbol}")
-                return False
-            
-            # Check for issues
-            nan_count = df.isnull().sum().sum()
-            invalid_candles = ((df['low'] > df['high']).sum() + 
-                              (df['close'] > df['high']).sum() + 
-                              (df['close'] < df['low']).sum())
-            
-            logger.info(f"\n=== Data Validation: {symbol} ===")
-            logger.info(f"Total candles: {len(df)}")
-            logger.info(f"NaN values: {nan_count}")
-            logger.info(f"Invalid candles: {invalid_candles}")
-            logger.info(f"Date range: {df['date'].min()} to {df['date'].max()}")
-            
-            if nan_count > 0 or invalid_candles > 0:
-                logger.warning("⚠️  Data quality issues detected")
-                return False
-            
-            logger.info("✅ Data validation passed")
-            return True
-        
-        except Exception as e:
-            logger.error(f"❌ Validation error: {e}")
-            return False
+            print(f"[✗] Error saving to SQLite: {e}")
+            raise
+
+    def verify_sqlite_data(self, db_path):
+        """Verify data was saved correctly."""
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT pair, COUNT(*) as count
+            FROM forex_ohlcv
+            GROUP BY pair
+            ORDER BY pair
+        """)
+
+        print("\n[VERIFICATION] Data in database:")
+        for pair, count in cursor.fetchall():
+            print(f"  {pair}: {count} bars")
+
+        conn.close()
 
 
+# ============================================================================
+# MAIN
+# ============================================================================
 def main():
-    """Main execution"""
-    logger.info("\n" + "="*50)
-    logger.info("FOREX DATA COLLECTOR - INTERACTIVE BROKERS")
-    logger.info("="*50 + "\n")
+    """Fetch 1-year forex data from IB and save to SQLite."""
     
+    print("=" * 70)
+    print("FOREX SMC SYSTEM - IB DATA COLLECTOR")
+    print("=" * 70)
+    print(f"Account: {IB_ACCOUNT}")
+    print(f"Connection: {IB_HOST}:{IB_PORT}")
+    print(f"Pairs: {', '.join([f'{p[0]}/{p[1]}' for p in FOREX_PAIRS])}")
+    print("=" * 70)
+
     # Initialize collector
-    collector = IBDataCollector(db_path='data/forex_1year.db')
+    collector = ForexDataCollector()
     
-    # Connect to TWS
-    if not collector.connect_to_tws():
-        logger.error("Failed to connect to TWS. Exiting.")
-        return
-    
-    # Wait for connection to stabilize
-    time.sleep(2)
-    
-    # Fetch data for each pair
-    pairs = ['EUR.USD', 'GBP.USD', 'AUD.USD', 'USD.JPY']
-    
-    for pair in pairs:
-        logger.info(f"\n--- Fetching {pair} ---")
+    try:
+        # Connect to TWS
+        collector.connect_to_tws()
         
-        # Request data
-        req_id = collector.fetch_forex_data(pair, duration='1 Y', barsize='4 hours')
-        
-        if req_id is not None:
-            # Save to database
-            collector.save_to_db(pair, req_id)
-            
-            # Validate
-            collector.validate_data(pair)
-        
-        # Wait between requests
+        # Wait for connection
         time.sleep(2)
-    
-    # Disconnect
-    collector.disconnect_from_tws()
-    
-    logger.info("\n" + "="*50)
-    logger.info("✅ DATA COLLECTION COMPLETE")
-    logger.info("="*50 + "\n")
+        if not collector.is_connected:
+            print("[✗] FAILED: Could not connect to TWS")
+            print("    - Ensure TWS is running")
+            print("    - Ensure API is enabled (Edit > Global Configuration > API > Settings)")
+            print(f"    - Ensure port is {IB_PORT}")
+            sys.exit(1)
+
+        # Request data for each pair
+        req_ids = []
+        for pair_from, pair_to in FOREX_PAIRS:
+            contract = collector.create_forex_contract(pair_from, pair_to)
+            pair_name = f"{pair_from}/{pair_to}"
+            req_id = collector.request_historical_data(contract, pair_name)
+            req_ids.append(req_id)
+
+        # Wait for all requests to complete
+        print("\n[INFO] Waiting for all data requests to complete...")
+        time.sleep(30)  # Increased timeout for reliability
+
+        # Save to SQLite
+        collector.save_to_sqlite()
+
+        print("\n[✓] SUCCESS: Data collection complete!")
+        print(f"[✓] Database: {os.path.join(os.path.dirname(__file__), '../data/forex_1year.db')}")
+
+    except Exception as e:
+        print(f"\n[✗] ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+    finally:
+        # Disconnect
+        collector.disconnect_from_tws()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
